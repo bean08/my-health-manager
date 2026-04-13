@@ -7,20 +7,17 @@ enum AppIconFactory {
 
     let bounds = NSRect(x: 0, y: 0, width: size, height: size)
     let basePath = NSBezierPath(roundedRect: bounds, xRadius: size * 0.24, yRadius: size * 0.24)
-    let baseGradient = NSGradient(colors: [
-      NSColor(calibratedRed: 0.96, green: 0.84, blue: 0.63, alpha: 1),
-      NSColor(calibratedRed: 0.90, green: 0.56, blue: 0.47, alpha: 1),
-    ])!
-    baseGradient.draw(in: basePath, angle: -90)
+    NSColor(calibratedRed: 0.95, green: 0.70, blue: 0.54, alpha: 1).setFill()
+    basePath.fill()
 
     let haloPath = NSBezierPath(ovalIn: NSRect(x: size * 0.14, y: size * 0.18, width: size * 0.72, height: size * 0.64))
-    NSColor(calibratedRed: 1.0, green: 0.97, blue: 0.92, alpha: 0.45).setFill()
+    NSColor(calibratedRed: 0.99, green: 0.87, blue: 0.76, alpha: 1).setFill()
     haloPath.fill()
 
     let ringRect = NSRect(x: size * 0.18, y: size * 0.18, width: size * 0.64, height: size * 0.64)
     let ringPath = NSBezierPath(ovalIn: ringRect)
     ringPath.lineWidth = size * 0.045
-    NSColor(calibratedRed: 0.47, green: 0.21, blue: 0.20, alpha: 0.92).setStroke()
+    NSColor(calibratedRed: 0.63, green: 0.28, blue: 0.20, alpha: 1).setStroke()
     ringPath.stroke()
 
     let heart = NSBezierPath()
@@ -55,7 +52,7 @@ enum AppIconFactory {
       controlPoint1: NSPoint(x: size * 0.73, y: size * 0.42),
       controlPoint2: NSPoint(x: size * 0.64, y: size * 0.39)
     )
-    NSColor(calibratedRed: 0.99, green: 0.96, blue: 0.94, alpha: 1).setFill()
+    NSColor(calibratedRed: 1.0, green: 0.98, blue: 0.95, alpha: 1).setFill()
     heart.fill()
 
     let pulse = NSBezierPath()
@@ -68,10 +65,10 @@ enum AppIconFactory {
     pulse.line(to: NSPoint(x: size * 0.54, y: size * 0.35))
     pulse.line(to: NSPoint(x: size * 0.60, y: size * 0.44))
     pulse.line(to: NSPoint(x: size * 0.72, y: size * 0.44))
-    NSColor(calibratedRed: 0.86, green: 0.34, blue: 0.31, alpha: 1).setStroke()
+    NSColor(calibratedRed: 0.84, green: 0.35, blue: 0.24, alpha: 1).setStroke()
     pulse.stroke()
 
-    let sparkColor = NSColor(calibratedRed: 1.0, green: 0.91, blue: 0.46, alpha: 1)
+    let sparkColor = NSColor(calibratedRed: 1.0, green: 0.89, blue: 0.56, alpha: 1)
     for point in [
       NSPoint(x: size * 0.24, y: size * 0.75),
       NSPoint(x: size * 0.77, y: size * 0.72),

@@ -2,7 +2,6 @@ import AppKit
 import Combine
 import Foundation
 import SwiftUI
-import WebKit
 
 enum SessionState: String {
   case idle
@@ -145,6 +144,10 @@ struct AppDiskStore: Codable {
   var version: Int
   var reminders: [ReminderConfig]
   var settings: GlobalSettings
+}
+
+final class WindowVisibilityStore: ObservableObject {
+  @Published var isMainWindowVisible = true
 }
 
 final class ReminderStore: ObservableObject {
@@ -322,7 +325,6 @@ enum HealthModule: String, CaseIterable, Identifiable {
 
 final class ReminderManager: ObservableObject {
   @Published private(set) var stateByID: [UUID: SessionState] = [:]
-  @Published private(set) var remainingByID: [UUID: Int] = [:]
   @Published private(set) var currentAlertReminderID: UUID?
   @Published private(set) var activeApplicationName: String = ""
 
@@ -364,21 +366,43 @@ final class ReminderManager: ObservableObject {
   }
 
   func remainingSeconds(for reminderID: UUID) -> Int {
-    remainingByID[reminderID] ?? 0
+    switch state(for: reminderID) {
+    case .running:
+      guard let dueDate = dueDateByID[reminderID] else { return 0 }
+      return max(Int(dueDate.timeIntervalSinceNow.rounded(.down)), 0)
+    case .paused:
+      return max(pausedSecondsByID[reminderID] ?? 0, 0)
+    case .idle, .alerting:
+      return 0
+    }
   }
 
   func formattedRemaining(for reminderID: UUID) -> String {
-    let seconds = max(remainingSeconds(for: reminderID), 0)
+    formattedRemaining(for: reminderID, now: Date())
+  }
+
+  func formattedRemaining(for reminderID: UUID, now: Date) -> String {
+    let seconds = max(remainingSeconds(for: reminderID, now: now), 0)
     return String(format: "%02d:%02d", seconds / 60, seconds % 60)
+  }
+
+  func remainingSeconds(for reminderID: UUID, now: Date) -> Int {
+    switch state(for: reminderID) {
+    case .running:
+      guard let dueDate = dueDateByID[reminderID] else { return 0 }
+      return max(Int(dueDate.timeIntervalSince(now).rounded(.down)), 0)
+    case .paused:
+      return max(pausedSecondsByID[reminderID] ?? 0, 0)
+    case .idle, .alerting:
+      return 0
+    }
   }
 
   func start(_ reminder: ReminderConfig) {
     let interval = max(60, Int(reminder.intervalMinutes * 60))
     dueDateByID[reminder.id] = Date().addingTimeInterval(TimeInterval(interval))
-    remainingByID[reminder.id] = interval
     pausedSecondsByID[reminder.id] = 0
     stateByID[reminder.id] = .running
-    objectWillChange.send()
   }
 
   func pause(_ reminder: ReminderConfig) {
@@ -392,14 +416,12 @@ final class ReminderManager: ObservableObject {
     guard state(for: reminder.id) == .paused else { return }
     let interval = max(pausedSecondsByID[reminder.id] ?? 1, 1)
     dueDateByID[reminder.id] = Date().addingTimeInterval(TimeInterval(interval))
-    remainingByID[reminder.id] = interval
     pausedSecondsByID[reminder.id] = 0
     stateByID[reminder.id] = .running
   }
 
   func stop(_ reminder: ReminderConfig) {
     dueDateByID[reminder.id] = nil
-    remainingByID[reminder.id] = 0
     pausedSecondsByID[reminder.id] = 0
     stateByID[reminder.id] = .idle
     removeFromAlertFlow(reminder.id)
@@ -419,7 +441,6 @@ final class ReminderManager: ObservableObject {
     let interval = max(60, Int(reminder.snoozeMinutes * 60))
     removeFromAlertFlow(reminder.id)
     dueDateByID[reminder.id] = Date().addingTimeInterval(TimeInterval(interval))
-    remainingByID[reminder.id] = interval
     pausedSecondsByID[reminder.id] = 0
     stateByID[reminder.id] = .running
   }
@@ -487,14 +508,8 @@ final class ReminderManager: ObservableObject {
   private func tick(now: Date) {
     for reminder in store.reminders {
       guard state(for: reminder.id) == .running, let dueDate = dueDateByID[reminder.id] else {
-        if state(for: reminder.id) == .idle {
-          remainingByID[reminder.id] = 0
-        }
         continue
       }
-
-      let seconds = max(Int(dueDate.timeIntervalSince(now).rounded(.down)), 0)
-      remainingByID[reminder.id] = seconds
       if now >= dueDate {
         triggerAlert(for: reminder)
       }
@@ -505,14 +520,12 @@ final class ReminderManager: ObservableObject {
     if shouldSuppressAlert(for: reminder) {
       let retryAfter: Int = 60
       dueDateByID[reminder.id] = Date().addingTimeInterval(TimeInterval(retryAfter))
-      remainingByID[reminder.id] = retryAfter
       pausedSecondsByID[reminder.id] = 0
       stateByID[reminder.id] = .running
       return
     }
 
     dueDateByID[reminder.id] = nil
-    remainingByID[reminder.id] = 0
     pausedSecondsByID[reminder.id] = 0
     stateByID[reminder.id] = .alerting
 
@@ -549,7 +562,6 @@ final class ReminderManager: ObservableObject {
     let validIDs = Set(reminders.map(\.id))
     dueDateByID = dueDateByID.filter { validIDs.contains($0.key) }
     pausedSecondsByID = pausedSecondsByID.filter { validIDs.contains($0.key) }
-    remainingByID = remainingByID.filter { validIDs.contains($0.key) }
     stateByID = stateByID.filter { validIDs.contains($0.key) }
     alertQueue.removeAll { !validIDs.contains($0) }
     if let currentAlertReminderID, !validIDs.contains(currentAlertReminderID) {
@@ -558,14 +570,13 @@ final class ReminderManager: ObservableObject {
 
     for reminder in reminders where stateByID[reminder.id] == nil {
       stateByID[reminder.id] = .idle
-      remainingByID[reminder.id] = 0
     }
   }
 }
 
 final class AlertWindowController {
   private var panel: NSPanel?
-  private let panelWidth: CGFloat = 438
+  private let panelWidth: CGFloat = 329
   private let minimumPanelHeight: CGFloat = 280
 
   func present(manager: ReminderManager, reminder: ReminderConfig, baseDirectoryURL: URL) {
@@ -637,9 +648,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
   private var cancellables: Set<AnyCancellable> = []
   private let alertWindowController = AlertWindowController()
   private var isBound = false
+  private var isStatusMenuOpen = false
+  private var statusTimer: Timer?
 
   var store: ReminderStore?
   var manager: ReminderManager?
+  var windowVisibilityStore: WindowVisibilityStore?
 
   func applicationDidFinishLaunching(_ notification: Notification) {
     NSApp.setActivationPolicy(.accessory)
@@ -652,6 +666,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     self.store = store
     self.manager = manager
     bindIfNeeded()
+    startStatusUpdatesIfNeeded()
     updateStatusItem()
   }
 
@@ -660,11 +675,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     window.delegate = self
     window.setContentSize(NSSize(width: 1140, height: 720))
     window.center()
+    if windowVisibilityStore?.isMainWindowVisible != window.isVisible {
+      windowVisibilityStore?.isMainWindowVisible = window.isVisible
+    }
   }
 
   func windowShouldClose(_ sender: NSWindow) -> Bool {
     sender.orderOut(nil)
     NSApp.setActivationPolicy(.accessory)
+    if windowVisibilityStore?.isMainWindowVisible != false {
+      windowVisibilityStore?.isMainWindowVisible = false
+    }
     return false
   }
 
@@ -673,6 +694,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     mainWindow?.makeKeyAndOrderFront(nil)
     mainWindow?.orderFrontRegardless()
     NSApp.activate(ignoringOtherApps: true)
+    if windowVisibilityStore?.isMainWindowVisible != true {
+      windowVisibilityStore?.isMainWindowVisible = true
+    }
   }
 
   @objc func quitApp(_ sender: Any?) {
@@ -734,20 +758,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
       }
       .store(in: &cancellables)
 
-    manager.$remainingByID
-      .receive(on: RunLoop.main)
-      .sink { [weak self] _ in
-        self?.updateStatusItem()
-        self?.updateStatusMenuContent()
-      }
-      .store(in: &cancellables)
-
     store?.$globalSettings
       .receive(on: RunLoop.main)
       .sink { [weak self] _ in
         self?.rebuildStatusMenu()
       }
       .store(in: &cancellables)
+  }
+
+  private func startStatusUpdatesIfNeeded() {
+    guard statusTimer == nil else { return }
+    statusTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+      self?.updateStatusItem()
+    }
+    if let statusTimer {
+      RunLoop.main.add(statusTimer, forMode: .common)
+    }
   }
 
   private func updateAlertPresentation() {
@@ -761,9 +787,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
   private func updateStatusItem() {
     guard let button = statusItem?.button else { return }
-    button.title = ""
+    if !button.title.isEmpty {
+      button.title = ""
+    }
     button.toolTip = "我的健康助手"
-    updateStatusMenuContent()
+    if isStatusMenuOpen {
+      updateStatusMenuContent()
+    }
   }
 
   private func rebuildStatusMenu() {
@@ -850,18 +880,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
 extension AppDelegate: NSMenuDelegate {
   func menuWillOpen(_ menu: NSMenu) {
+    isStatusMenuOpen = true
     updateStatusMenuContent()
+  }
+
+  func menuDidClose(_ menu: NSMenu) {
+    isStatusMenuOpen = false
   }
 }
 
 struct MainWindowAccessor: NSViewRepresentable {
   let onResolve: (NSWindow) -> Void
 
+  func makeCoordinator() -> Coordinator {
+    Coordinator()
+  }
+
   func makeNSView(context: Context) -> NSView {
     let view = NSView()
     DispatchQueue.main.async {
       if let window = view.window {
-        onResolve(window)
+        context.coordinator.resolve(window: window, onResolve: onResolve)
       }
     }
     return view
@@ -870,8 +909,18 @@ struct MainWindowAccessor: NSViewRepresentable {
   func updateNSView(_ nsView: NSView, context: Context) {
     DispatchQueue.main.async {
       if let window = nsView.window {
-        onResolve(window)
+        context.coordinator.resolve(window: window, onResolve: onResolve)
       }
+    }
+  }
+
+  final class Coordinator {
+    private weak var lastWindow: NSWindow?
+
+    func resolve(window: NSWindow, onResolve: (NSWindow) -> Void) {
+      guard lastWindow !== window else { return }
+      lastWindow = window
+      onResolve(window)
     }
   }
 }
@@ -880,6 +929,7 @@ struct MyHealthManagerApp: App {
   @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
   @StateObject private var store: ReminderStore
   @StateObject private var manager: ReminderManager
+  @StateObject private var windowVisibilityStore = WindowVisibilityStore()
 
   init() {
     let store = ReminderStore()
@@ -891,10 +941,12 @@ struct MyHealthManagerApp: App {
     WindowGroup("我的健康助手") {
       ContentView(manager: manager)
         .environmentObject(store)
+        .environmentObject(windowVisibilityStore)
         .background(MainWindowAccessor { window in
           appDelegate.registerMainWindow(window)
         })
         .onAppear {
+          appDelegate.windowVisibilityStore = windowVisibilityStore
           appDelegate.configure(store: store, manager: manager)
         }
     }
@@ -905,6 +957,7 @@ struct MyHealthManagerApp: App {
 struct ContentView: View {
   @ObservedObject var manager: ReminderManager
   @EnvironmentObject private var store: ReminderStore
+  @EnvironmentObject private var windowVisibilityStore: WindowVisibilityStore
   @State private var selectedModule: HealthModule = .reminders
   @State private var storagePathDraft: String = ""
 
@@ -973,8 +1026,9 @@ struct ContentView: View {
           ForEach(store.reminders) { reminder in
             ReminderListRow(
               reminder: reminder,
+              manager: manager,
+              isWindowVisible: windowVisibilityStore.isMainWindowVisible,
               state: manager.state(for: reminder.id),
-              remainingText: manager.formattedRemaining(for: reminder.id),
               isSelected: store.selectedReminder?.id == reminder.id
             ) {
               store.select(reminder.id)
@@ -1158,9 +1212,11 @@ struct ContentView: View {
         }
         Spacer()
         if state == .running || state == .paused {
-          Text(manager.formattedRemaining(for: reminder.id))
-            .font(.system(size: 36, weight: .bold, design: .rounded))
-            .monospacedDigit()
+          LargeReminderCountdownText(
+            manager: manager,
+            reminderID: reminder.id,
+            isActive: windowVisibilityStore.isMainWindowVisible
+          )
         }
       }
 
@@ -1332,8 +1388,9 @@ struct ContentView: View {
 
 struct ReminderListRow: View {
   let reminder: ReminderConfig
+  let manager: ReminderManager
+  let isWindowVisible: Bool
   let state: SessionState
-  let remainingText: String
   let isSelected: Bool
   let action: () -> Void
 
@@ -1349,9 +1406,22 @@ struct ReminderListRow: View {
           Text(reminder.title)
             .font(.body.weight(.semibold))
             .foregroundStyle(isSelected ? Color.white : Color.primary)
-          Text(state == .running || state == .paused ? "\(state.label) · \(remainingText)" : state.label)
+          if state == .running || state == .paused {
+            HStack(spacing: 4) {
+              Text(state.label)
+              ReminderCountdownText(
+                manager: manager,
+                reminderID: reminder.id,
+                isActive: isWindowVisible
+              )
+            }
             .font(.caption)
             .foregroundStyle(isSelected ? Color.white.opacity(0.84) : .secondary)
+          } else {
+            Text(state.label)
+              .font(.caption)
+              .foregroundStyle(isSelected ? Color.white.opacity(0.84) : .secondary)
+          }
         }
 
         Spacer()
@@ -1367,6 +1437,50 @@ struct ReminderListRow: View {
       )
     }
     .buttonStyle(.plain)
+  }
+}
+
+struct ReminderCountdownText: View {
+  let manager: ReminderManager
+  let reminderID: UUID
+  let isActive: Bool
+
+  var body: some View {
+    Group {
+      if isActive {
+        TimelineView(.periodic(from: .now, by: 1)) { context in
+          Text("· \(manager.formattedRemaining(for: reminderID, now: context.date))")
+            .monospacedDigit()
+        }
+      } else {
+        Text("· \(manager.formattedRemaining(for: reminderID))")
+          .monospacedDigit()
+      }
+    }
+  }
+}
+
+struct LargeReminderCountdownText: View {
+  let manager: ReminderManager
+  let reminderID: UUID
+  let isActive: Bool
+
+  var body: some View {
+    Group {
+      if isActive {
+        TimelineView(.periodic(from: .now, by: 1)) { context in
+          countdownText(manager.formattedRemaining(for: reminderID, now: context.date))
+        }
+      } else {
+        countdownText(manager.formattedRemaining(for: reminderID))
+      }
+    }
+  }
+
+  private func countdownText(_ text: String) -> some View {
+    Text(text)
+      .font(.system(size: 36, weight: .bold, design: .rounded))
+      .monospacedDigit()
   }
 }
 
@@ -1461,7 +1575,15 @@ struct MarkdownEditorSection: View {
         MarkdownTextEditor(text: $draftText)
           .frame(minHeight: 220)
 
-        MarkdownPreview(markdown: draftText, baseDirectoryURL: baseDirectoryURL)
+        ScrollView {
+          MarkdownPreviewContent(
+            markdown: draftText,
+            baseDirectoryURL: baseDirectoryURL,
+            bulletColor: Color.accentColor
+          )
+          .padding(14)
+          .frame(maxWidth: .infinity, alignment: .leading)
+        }
           .frame(minWidth: 300, minHeight: 220)
           .background(
             RoundedRectangle(cornerRadius: 14, style: .continuous)
@@ -1590,98 +1712,76 @@ final class UndoFriendlyTextView: NSTextView {
   }
 }
 
-struct MarkdownPreview: NSViewRepresentable {
+struct MarkdownPreviewContent: View {
   let markdown: String
   let baseDirectoryURL: URL
+  let bulletColor: Color
 
-  func makeNSView(context: Context) -> WKWebView {
-    let configuration = WKWebViewConfiguration()
-    let webView = WKWebView(frame: .zero, configuration: configuration)
-    webView.setValue(false, forKey: "drawsBackground")
-    return webView
-  }
-
-  func updateNSView(_ webView: WKWebView, context: Context) {
-    webView.loadHTMLString(
-      MarkdownRenderer.html(
-        from: ReminderImageSecurity.sanitizedMarkdown(markdown, baseDirectoryURL: baseDirectoryURL)
-      ),
-      baseURL: baseDirectoryURL
-    )
-  }
-}
-
-struct AutoSizingMarkdownPreview: NSViewRepresentable {
-  let markdown: String
-  let baseDirectoryURL: URL
-  let onHeightChange: (CGFloat) -> Void
-
-  func makeCoordinator() -> Coordinator {
-    Coordinator(onHeightChange: onHeightChange)
-  }
-
-  func makeNSView(context: Context) -> WKWebView {
-    let controller = WKUserContentController()
-    controller.add(context.coordinator, name: "contentHeight")
-
-    let configuration = WKWebViewConfiguration()
-    configuration.userContentController = controller
-
-    let webView = WKWebView(frame: .zero, configuration: configuration)
-    webView.navigationDelegate = context.coordinator
-    webView.setValue(false, forKey: "drawsBackground")
-    if let scrollView = webView.enclosingScrollView {
-      scrollView.drawsBackground = false
-      scrollView.hasVerticalScroller = false
-      scrollView.hasHorizontalScroller = false
-      scrollView.verticalScrollElasticity = NSScrollView.Elasticity.none
-      scrollView.horizontalScrollElasticity = NSScrollView.Elasticity.none
-    }
-    return webView
-  }
-
-  func updateNSView(_ webView: WKWebView, context: Context) {
-    context.coordinator.onHeightChange = onHeightChange
-    webView.loadHTMLString(
-      MarkdownRenderer.autoSizingHTML(
-        from: ReminderImageSecurity.sanitizedMarkdown(markdown, baseDirectoryURL: baseDirectoryURL)
-      ),
-      baseURL: baseDirectoryURL
+  private var blocks: [AlertMarkdownBlock] {
+    AlertMarkdownParser.parse(
+      ReminderImageSecurity.sanitizedMarkdown(markdown, baseDirectoryURL: baseDirectoryURL)
     )
   }
 
-  static func dismantleNSView(_ webView: WKWebView, coordinator: Coordinator) {
-    webView.configuration.userContentController.removeScriptMessageHandler(forName: "contentHeight")
+  var body: some View {
+    VStack(alignment: .leading, spacing: 10) {
+      ForEach(Array(blocks.enumerated()), id: \.offset) { _, block in
+        blockView(block)
+      }
+    }
+    .frame(maxWidth: .infinity, alignment: .leading)
   }
 
-  final class Coordinator: NSObject, WKNavigationDelegate, WKScriptMessageHandler {
-    var onHeightChange: (CGFloat) -> Void
+  @ViewBuilder
+  private func blockView(_ block: AlertMarkdownBlock) -> some View {
+    switch block {
+    case let .heading(level, text):
+      Text(markdownText(from: text))
+        .font(headingFont(level: level))
+        .foregroundStyle(Color.primary)
+        .fixedSize(horizontal: false, vertical: true)
 
-    init(onHeightChange: @escaping (CGFloat) -> Void) {
-      self.onHeightChange = onHeightChange
-    }
+    case let .paragraph(text):
+      Text(markdownText(from: text))
+        .font(.system(size: 15))
+        .foregroundStyle(Color.primary)
+        .fixedSize(horizontal: false, vertical: true)
 
-    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-      webView.evaluateJavaScript("window.__reportHeight && window.__reportHeight();", completionHandler: nil)
-    }
-
-    func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
-      guard message.name == "contentHeight" else { return }
-
-      let rawValue: Double?
-      if let number = message.body as? NSNumber {
-        rawValue = number.doubleValue
-      } else if let value = message.body as? Double {
-        rawValue = value
-      } else {
-        rawValue = nil
+    case let .list(items):
+      VStack(alignment: .leading, spacing: 6) {
+        ForEach(Array(items.enumerated()), id: \.offset) { _, item in
+          HStack(alignment: .top, spacing: 8) {
+            Text("•")
+              .font(.system(size: 15, weight: .bold))
+              .foregroundStyle(bulletColor)
+            Text(markdownText(from: item))
+              .font(.system(size: 15))
+              .foregroundStyle(Color.primary)
+              .fixedSize(horizontal: false, vertical: true)
+          }
+        }
       }
 
-      guard let rawValue else { return }
-      let resolvedHeight = max(80, ceil(rawValue))
-      DispatchQueue.main.async {
-        self.onHeightChange(resolvedHeight)
-      }
+    case let .image(alt, source):
+      AlertMarkdownImage(source: source, baseDirectoryURL: baseDirectoryURL, alt: alt)
+    }
+  }
+
+  private func markdownText(from source: String) -> AttributedString {
+    if let attributed = try? AttributedString(markdown: source) {
+      return attributed
+    }
+    return AttributedString(source)
+  }
+
+  private func headingFont(level: Int) -> Font {
+    switch level {
+    case 1:
+      return .system(size: 23, weight: .bold, design: .rounded)
+    case 2:
+      return .system(size: 19, weight: .bold, design: .rounded)
+    default:
+      return .system(size: 17, weight: .semibold, design: .rounded)
     }
   }
 }
@@ -1898,70 +1998,12 @@ struct AlertMarkdownContent: View {
   let markdown: String
   let baseDirectoryURL: URL
 
-  private var blocks: [AlertMarkdownBlock] {
-    AlertMarkdownParser.parse(markdown)
-  }
-
   var body: some View {
-    VStack(alignment: .leading, spacing: 10) {
-      ForEach(Array(blocks.enumerated()), id: \.offset) { _, block in
-        blockView(block)
-      }
-    }
-    .frame(maxWidth: .infinity, alignment: .leading)
-  }
-
-  @ViewBuilder
-  private func blockView(_ block: AlertMarkdownBlock) -> some View {
-    switch block {
-    case let .heading(level, text):
-      Text(markdownText(from: text))
-        .font(headingFont(level: level))
-        .foregroundStyle(Color.primary)
-        .fixedSize(horizontal: false, vertical: true)
-
-    case let .paragraph(text):
-      Text(markdownText(from: text))
-        .font(.system(size: 15))
-        .foregroundStyle(Color.primary)
-        .fixedSize(horizontal: false, vertical: true)
-
-    case let .list(items):
-      VStack(alignment: .leading, spacing: 6) {
-        ForEach(Array(items.enumerated()), id: \.offset) { _, item in
-          HStack(alignment: .top, spacing: 8) {
-            Text("•")
-              .font(.system(size: 15, weight: .bold))
-              .foregroundStyle(Color(red: 0.82, green: 0.34, blue: 0.30))
-            Text(markdownText(from: item))
-              .font(.system(size: 15))
-              .foregroundStyle(Color.primary)
-              .fixedSize(horizontal: false, vertical: true)
-          }
-        }
-      }
-
-    case let .image(alt, source):
-      AlertMarkdownImage(source: source, baseDirectoryURL: baseDirectoryURL, alt: alt)
-    }
-  }
-
-  private func markdownText(from source: String) -> AttributedString {
-    if let attributed = try? AttributedString(markdown: source) {
-      return attributed
-    }
-    return AttributedString(source)
-  }
-
-  private func headingFont(level: Int) -> Font {
-    switch level {
-    case 1:
-      return .system(size: 23, weight: .bold, design: .rounded)
-    case 2:
-      return .system(size: 19, weight: .bold, design: .rounded)
-    default:
-      return .system(size: 17, weight: .semibold, design: .rounded)
-    }
+    MarkdownPreviewContent(
+      markdown: markdown,
+      baseDirectoryURL: baseDirectoryURL,
+      bulletColor: Color(red: 0.82, green: 0.34, blue: 0.30)
+    )
   }
 }
 
@@ -1991,175 +2033,6 @@ struct AlertMarkdownImage: View {
       }
     }
     .frame(maxWidth: .infinity, alignment: .leading)
-  }
-}
-
-enum MarkdownRenderer {
-  static func html(from markdown: String) -> String {
-    htmlDocument(body: renderBlocks(markdown), includeAutoSizingScript: false)
-  }
-
-  static func autoSizingHTML(from markdown: String) -> String {
-    htmlDocument(body: renderBlocks(markdown), includeAutoSizingScript: true)
-  }
-
-  private static func htmlDocument(body: String, includeAutoSizingScript: Bool) -> String {
-    let script = includeAutoSizingScript ? """
-      <script>
-        function reportHeight() {
-          const height = Math.max(
-            document.body.scrollHeight,
-            document.documentElement.scrollHeight
-          );
-          window.webkit.messageHandlers.contentHeight.postMessage(height);
-        }
-        window.__reportHeight = reportHeight;
-        window.addEventListener('load', reportHeight);
-        window.addEventListener('resize', reportHeight);
-        if (document.fonts && document.fonts.ready) {
-          document.fonts.ready.then(reportHeight);
-        }
-        const observer = new ResizeObserver(reportHeight);
-        observer.observe(document.body);
-        Array.from(document.images).forEach((image) => {
-          if (!image.complete) {
-            image.addEventListener('load', reportHeight);
-            image.addEventListener('error', reportHeight);
-          }
-        });
-      </script>
-    """ : ""
-
-    return """
-    <html>
-    <head>
-      <meta charset="utf-8">
-      <style>
-        html, body { margin: 0; padding: 0; background: transparent; overflow: hidden; }
-        body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; padding: 14px; color: #1f2937; line-height: 1.55; background: transparent; }
-        h1, h2, h3 { margin: 0 0 10px 0; }
-        p { margin: 0 0 10px 0; }
-        p:last-child, ul:last-child, h1:last-child, h2:last-child, h3:last-child { margin-bottom: 0; }
-        ul { margin: 0 0 10px 20px; padding: 0; }
-        code { background: #f3f4f6; padding: 2px 6px; border-radius: 6px; }
-        img { display: block; max-width: 100%; height: auto; border-radius: 12px; margin: 8px 0; }
-        strong { font-weight: 700; }
-        em { font-style: italic; }
-      </style>
-    </head>
-    <body>\(body)</body>
-    \(script)
-    </html>
-    """
-  }
-
-  private static func renderBlocks(_ markdown: String) -> String {
-    let lines = markdown.replacingOccurrences(of: "\r\n", with: "\n").components(separatedBy: "\n")
-    var html: [String] = []
-    var paragraph: [String] = []
-    var listItems: [String] = []
-
-    func flushParagraph() {
-      guard !paragraph.isEmpty else { return }
-      let content = paragraph.joined(separator: "<br>")
-      html.append("<p>\(renderInline(content))</p>")
-      paragraph.removeAll()
-    }
-
-    func flushList() {
-      guard !listItems.isEmpty else { return }
-      let items = listItems.map { "<li>\(renderInline($0))</li>" }.joined()
-      html.append("<ul>\(items)</ul>")
-      listItems.removeAll()
-    }
-
-    for rawLine in lines {
-      let line = rawLine.trimmingCharacters(in: .whitespaces)
-      if line.isEmpty {
-        flushParagraph()
-        flushList()
-        continue
-      }
-      if line.hasPrefix("# ") {
-        flushParagraph()
-        flushList()
-        html.append("<h1>\(renderInline(String(line.dropFirst(2))))</h1>")
-        continue
-      }
-      if line.hasPrefix("## ") {
-        flushParagraph()
-        flushList()
-        html.append("<h2>\(renderInline(String(line.dropFirst(3))))</h2>")
-        continue
-      }
-      if line.hasPrefix("### ") {
-        flushParagraph()
-        flushList()
-        html.append("<h3>\(renderInline(String(line.dropFirst(4))))</h3>")
-        continue
-      }
-      if line.hasPrefix("- ") {
-        flushParagraph()
-        listItems.append(String(line.dropFirst(2)))
-        continue
-      }
-      paragraph.append(line)
-    }
-
-    flushParagraph()
-    flushList()
-    return html.joined()
-  }
-
-  private static func renderInline(_ source: String) -> String {
-    var text = escapeHTML(source)
-    text = replace(pattern: #"\!\[(.*?)\]\((.*?)\)"#, in: text) { matches in
-      let alt = matches[1]
-      let src = matches[2]
-      return "<img src=\"\(src)\" alt=\"\(alt)\">"
-    }
-    text = replace(pattern: #"\*\*(.*?)\*\*"#, in: text) { matches in
-      "<strong>\(matches[1])</strong>"
-    }
-    text = replace(pattern: #"`(.*?)`"#, in: text) { matches in
-      "<code>\(matches[1])</code>"
-    }
-    text = replace(pattern: #"(?<!\*)\*(?!\*)(.*?)(?<!\*)\*(?!\*)"#, in: text) { matches in
-      "<em>\(matches[1])</em>"
-    }
-    return text
-  }
-
-  private static func escapeHTML(_ text: String) -> String {
-    text
-      .replacingOccurrences(of: "&", with: "&amp;")
-      .replacingOccurrences(of: "<", with: "&lt;")
-      .replacingOccurrences(of: ">", with: "&gt;")
-      .replacingOccurrences(of: "\"", with: "&quot;")
-  }
-
-  private static func replace(
-    pattern: String,
-    in text: String,
-    transform: ([String]) -> String
-  ) -> String {
-    guard let regex = try? NSRegularExpression(pattern: pattern, options: []) else {
-      return text
-    }
-    let nsText = text as NSString
-    let matches = regex.matches(in: text, options: [], range: NSRange(location: 0, length: nsText.length))
-    var result = text
-    for match in matches.reversed() {
-      var groups: [String] = []
-      for index in 0..<match.numberOfRanges {
-        let range = match.range(at: index)
-        groups.append(range.location == NSNotFound ? "" : nsText.substring(with: range))
-      }
-      if let range = Range(match.range, in: result) {
-        result.replaceSubrange(range, with: transform(groups))
-      }
-    }
-    return result
   }
 }
 
@@ -2200,7 +2073,7 @@ struct AlertCardView: View {
             .stroke(Color.white.opacity(0.14), lineWidth: 1)
         )
 
-      HStack(spacing: 10) {
+      HStack(spacing: 8) {
         AlertActionButton(
           title: "开始下一轮",
           icon: "play.fill",
@@ -2230,10 +2103,10 @@ struct AlertCardView: View {
       }
       .padding(.top, 2)
     }
-    .padding(.horizontal, 24)
-    .padding(.top, 24)
-    .padding(.bottom, 28)
-    .frame(width: 438, alignment: .topLeading)
+    .padding(.horizontal, 18)
+    .padding(.top, 20)
+    .padding(.bottom, 22)
+    .frame(width: 329, alignment: .topLeading)
     .background(
       ZStack {
         LinearGradient(
@@ -2293,15 +2166,15 @@ struct AlertActionButton: View {
 
   var body: some View {
     Button(action: action) {
-      VStack(spacing: 5) {
+      VStack(spacing: 4) {
         Image(systemName: icon)
-          .font(.system(size: 15, weight: .bold))
+          .font(.system(size: 14, weight: .bold))
         Text(title)
-          .font(.system(size: 12, weight: .semibold))
+          .font(.system(size: 11, weight: .semibold))
           .lineLimit(1)
       }
       .frame(maxWidth: .infinity)
-      .frame(height: 54)
+      .frame(height: 46)
       .foregroundStyle(foregroundColor)
       .background(
         RoundedRectangle(cornerRadius: 13, style: .continuous)
