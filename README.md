@@ -63,13 +63,12 @@ Stored reminder fields:
 
 ## Release
 
-- Current version: `0.0.2`
-- Recommended Git tag: `0.0.2`
-- Latest changes in `0.0.2`:
-  - Added presentation suppression support for meeting and screen-sharing scenarios
-  - Added live countdown updates inside the menu bar menu
-  - Refined the alert popup with transparent styling, native content rendering, and auto-sized content
-  - Improved sidebar selection reliability for module switching
+- Current version: `0.0.3`
+- Recommended Git tag: `0.0.3`
+- Latest changes in `0.0.3`:
+  - Blocked remote image URLs in reminder Markdown previews and alerts
+  - Restricted reminder images to managed local files under the storage directory
+  - Imported inserted images into a local `attachments/` folder using relative paths
 - Release notes: [CHANGELOG.md](CHANGELOG.md)
 
 ## License

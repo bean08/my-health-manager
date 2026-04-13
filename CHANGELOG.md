@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog, and this project uses Semantic Versioning for releases.
 
+## [0.0.3] - 2026-04-13
+
+### Security
+- Blocked remote image URLs in reminder Markdown so preview and alert rendering stay local-only
+- Restricted reminder images to relative paths inside the configured storage directory
+
+### Changed
+- Imported inserted images into a managed `attachments/` directory and stored them as relative paths
+- Sanitized reminder image references before feeding Markdown into `WKWebView`
+
 ## [0.0.2] - 2026-04-13
 
 ### Added

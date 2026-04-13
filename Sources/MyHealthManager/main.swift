@@ -1308,7 +1308,10 @@ struct ContentView: View {
 
     guard panel.runModal() == .OK, let url = panel.url else { return }
     var updated = store.reminders.first(where: { $0.id == reminder.id }) ?? reminder
-    let markdown = "\n\n![图片](\(url.absoluteString))\n"
+    guard let importedPath = try? ReminderImageSecurity.importImage(from: url, baseDirectoryURL: store.storageDirectoryURL()) else {
+      return
+    }
+    let markdown = "\n\n![图片](\(importedPath))\n"
     updated.message += markdown
     store.update(updated)
   }
@@ -1481,7 +1484,9 @@ struct MarkdownPreview: NSViewRepresentable {
 
   func updateNSView(_ webView: WKWebView, context: Context) {
     webView.loadHTMLString(
-      MarkdownRenderer.html(from: markdown),
+      MarkdownRenderer.html(
+        from: ReminderImageSecurity.sanitizedMarkdown(markdown, baseDirectoryURL: baseDirectoryURL)
+      ),
       baseURL: baseDirectoryURL
     )
   }
@@ -1519,7 +1524,9 @@ struct AutoSizingMarkdownPreview: NSViewRepresentable {
   func updateNSView(_ webView: WKWebView, context: Context) {
     context.coordinator.onHeightChange = onHeightChange
     webView.loadHTMLString(
-      MarkdownRenderer.autoSizingHTML(from: markdown),
+      MarkdownRenderer.autoSizingHTML(
+        from: ReminderImageSecurity.sanitizedMarkdown(markdown, baseDirectoryURL: baseDirectoryURL)
+      ),
       baseURL: baseDirectoryURL
     )
   }
@@ -1557,6 +1564,118 @@ struct AutoSizingMarkdownPreview: NSViewRepresentable {
         self.onHeightChange(resolvedHeight)
       }
     }
+  }
+}
+
+enum ReminderImageSecurity {
+  private static let attachmentsDirectoryName = "attachments"
+
+  static func sanitizedMarkdown(_ markdown: String, baseDirectoryURL: URL) -> String {
+    let pattern = #"\!\[(.*?)\]\((.*?)\)"#
+    guard let regex = try? NSRegularExpression(pattern: pattern, options: []) else {
+      return markdown
+    }
+
+    let nsMarkdown = markdown as NSString
+    let matches = regex.matches(in: markdown, options: [], range: NSRange(location: 0, length: nsMarkdown.length))
+    var sanitized = markdown
+    for match in matches.reversed() {
+      guard match.numberOfRanges >= 3 else { continue }
+      let altRange = match.range(at: 1)
+      let sourceRange = match.range(at: 2)
+      guard altRange.location != NSNotFound, sourceRange.location != NSNotFound else { continue }
+
+      let alt = nsMarkdown.substring(with: altRange)
+      let source = nsMarkdown.substring(with: sourceRange)
+      let replacement: String
+      if let safeSource = sanitizedRelativeImageSource(source, baseDirectoryURL: baseDirectoryURL) {
+        replacement = "![\(alt)](\(safeSource))"
+      } else {
+        replacement = alt.isEmpty ? "" : alt
+      }
+
+      if let range = Range(match.range, in: sanitized) {
+        sanitized.replaceSubrange(range, with: replacement)
+      }
+    }
+    return sanitized
+  }
+
+  static func resolvedImageURL(for source: String, baseDirectoryURL: URL) -> URL? {
+    guard let relativeSource = sanitizedRelativeImageSource(source, baseDirectoryURL: baseDirectoryURL) else {
+      return nil
+    }
+    let candidate = baseDirectoryURL.appendingPathComponent(relativeSource)
+    let standardizedBase = baseDirectoryURL.standardizedFileURL
+    let standardizedCandidate = candidate.standardizedFileURL
+    guard standardizedCandidate.path.hasPrefix(standardizedBase.path + "/") else {
+      return nil
+    }
+    return standardizedCandidate
+  }
+
+  static func importImage(from sourceURL: URL, baseDirectoryURL: URL) throws -> String {
+    let fm = FileManager.default
+    let attachmentsDirectoryURL = baseDirectoryURL
+      .appendingPathComponent(attachmentsDirectoryName, isDirectory: true)
+      .standardizedFileURL
+
+    try fm.createDirectory(at: attachmentsDirectoryURL, withIntermediateDirectories: true)
+
+    let preferredName = sanitizedFilename(sourceURL.lastPathComponent)
+    let uniqueName = uniqueFilename(preferredName, in: attachmentsDirectoryURL, fileManager: fm)
+    let destinationURL = attachmentsDirectoryURL.appendingPathComponent(uniqueName, isDirectory: false)
+
+    if sourceURL.standardizedFileURL != destinationURL.standardizedFileURL {
+      if fm.fileExists(atPath: destinationURL.path) {
+        try fm.removeItem(at: destinationURL)
+      }
+      try fm.copyItem(at: sourceURL, to: destinationURL)
+    }
+
+    return attachmentsDirectoryName + "/" + uniqueName
+  }
+
+  private static func sanitizedRelativeImageSource(_ source: String, baseDirectoryURL: URL) -> String? {
+    let trimmed = source.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else { return nil }
+    if let url = URL(string: trimmed), url.scheme != nil {
+      return nil
+    }
+
+    let normalized = NSString(string: trimmed).expandingTildeInPath
+    guard !normalized.hasPrefix("/") else { return nil }
+
+    let relativeURL = URL(fileURLWithPath: normalized, relativeTo: baseDirectoryURL)
+    let standardizedBase = baseDirectoryURL.standardizedFileURL
+    let standardizedCandidate = relativeURL.standardizedFileURL
+    guard standardizedCandidate.path.hasPrefix(standardizedBase.path + "/") else {
+      return nil
+    }
+
+    return standardizedCandidate.path.replacingOccurrences(of: standardizedBase.path + "/", with: "")
+  }
+
+  private static func sanitizedFilename(_ filename: String) -> String {
+    let trimmed = filename.trimmingCharacters(in: .whitespacesAndNewlines)
+    let fallback = trimmed.isEmpty ? UUID().uuidString + ".png" : trimmed
+    let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "._-"))
+    let cleanedScalars = fallback.unicodeScalars.map { allowed.contains($0) ? Character($0) : "_" }
+    let cleaned = String(cleanedScalars)
+    return cleaned.isEmpty ? UUID().uuidString + ".png" : cleaned
+  }
+
+  private static func uniqueFilename(_ filename: String, in directoryURL: URL, fileManager: FileManager) -> String {
+    let ext = (filename as NSString).pathExtension
+    let base = (filename as NSString).deletingPathExtension
+    var candidate = filename
+    var index = 1
+    while fileManager.fileExists(atPath: directoryURL.appendingPathComponent(candidate).path) {
+      let suffix = "-\(index)"
+      candidate = ext.isEmpty ? base + suffix : base + suffix + "." + ext
+      index += 1
+    }
+    return candidate
   }
 }
 
@@ -1733,17 +1852,9 @@ struct AlertMarkdownImage: View {
   let alt: String
 
   private var resolvedImage: NSImage? {
-    let trimmed = source.trimmingCharacters(in: .whitespacesAndNewlines)
-    if let absoluteURL = URL(string: trimmed), absoluteURL.scheme != nil {
-      return NSImage(contentsOf: absoluteURL)
+    guard let fileURL = ReminderImageSecurity.resolvedImageURL(for: source, baseDirectoryURL: baseDirectoryURL) else {
+      return nil
     }
-
-    let normalizedPath = (trimmed as NSString).expandingTildeInPath
-    if normalizedPath.hasPrefix("/") {
-      return NSImage(contentsOfFile: normalizedPath)
-    }
-
-    let fileURL = baseDirectoryURL.appendingPathComponent(trimmed)
     return NSImage(contentsOf: fileURL)
   }
 
