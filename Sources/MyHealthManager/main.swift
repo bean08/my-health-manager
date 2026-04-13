@@ -215,6 +215,12 @@ final class ReminderStore: ObservableObject {
     reminders[index] = reminder
   }
 
+  func updateMessage(_ message: String, for reminderID: UUID) {
+    guard let index = reminders.firstIndex(where: { $0.id == reminderID }) else { return }
+    guard reminders[index].message != message else { return }
+    reminders[index].message = message
+  }
+
   func updateStorageFilePath(_ path: String) {
     let resolved = Self.resolveStorageFileURL(from: path)
     guard resolved != storageFileURL else { return }
@@ -1238,7 +1244,7 @@ struct ContentView: View {
         }
 
         MarkdownEditorSection(
-          text: binding(for: reminder).message,
+          text: messageBinding(for: reminder),
           baseDirectoryURL: store.storageDirectoryURL()
         )
       }
@@ -1257,6 +1263,13 @@ struct ContentView: View {
     Binding(
       get: { store.reminders.first(where: { $0.id == reminder.id }) ?? reminder },
       set: { store.update($0) }
+    )
+  }
+
+  private func messageBinding(for reminder: ReminderConfig) -> Binding<String> {
+    Binding(
+      get: { store.reminders.first(where: { $0.id == reminder.id })?.message ?? reminder.message },
+      set: { store.updateMessage($0, for: reminder.id) }
     )
   }
 
@@ -1439,20 +1452,16 @@ struct MinutesInputField: View {
 struct MarkdownEditorSection: View {
   @Binding var text: String
   let baseDirectoryURL: URL
+  @State private var draftText: String = ""
+  @State private var hasInitializedDraft = false
 
   var body: some View {
     VStack(alignment: .leading, spacing: 12) {
       HStack(alignment: .top, spacing: 16) {
-        TextEditor(text: $text)
-          .font(.body)
+        MarkdownTextEditor(text: $draftText)
           .frame(minHeight: 220)
-          .padding(8)
-          .background(
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
-              .stroke(Color.secondary.opacity(0.25), lineWidth: 1)
-          )
 
-        MarkdownPreview(markdown: text, baseDirectoryURL: baseDirectoryURL)
+        MarkdownPreview(markdown: draftText, baseDirectoryURL: baseDirectoryURL)
           .frame(minWidth: 300, minHeight: 220)
           .background(
             RoundedRectangle(cornerRadius: 14, style: .continuous)
@@ -1468,6 +1477,116 @@ struct MarkdownEditorSection: View {
         .font(.caption)
         .foregroundStyle(.secondary)
     }
+    .onAppear {
+      guard !hasInitializedDraft else { return }
+      draftText = text
+      hasInitializedDraft = true
+    }
+    .onChange(of: draftText) { newValue in
+      guard newValue != text else { return }
+      text = newValue
+    }
+    .onChange(of: text) { newValue in
+      guard newValue != draftText else { return }
+      draftText = newValue
+    }
+  }
+}
+
+struct MarkdownTextEditor: NSViewRepresentable {
+  @Binding var text: String
+
+  func makeCoordinator() -> Coordinator {
+    Coordinator(text: $text)
+  }
+
+  func makeNSView(context: Context) -> NSScrollView {
+    let scrollView = NSScrollView()
+    scrollView.drawsBackground = true
+    scrollView.backgroundColor = .textBackgroundColor
+    scrollView.hasVerticalScroller = true
+    scrollView.hasHorizontalScroller = false
+    scrollView.borderType = .noBorder
+    scrollView.autohidesScrollers = true
+
+    let textView = UndoFriendlyTextView()
+    textView.delegate = context.coordinator
+    textView.isRichText = false
+    textView.importsGraphics = false
+    textView.allowsImageEditing = false
+    textView.isAutomaticQuoteSubstitutionEnabled = false
+    textView.isAutomaticDashSubstitutionEnabled = false
+    textView.isAutomaticDataDetectionEnabled = false
+    textView.isAutomaticLinkDetectionEnabled = false
+    textView.isAutomaticTextCompletionEnabled = false
+    textView.isAutomaticSpellingCorrectionEnabled = false
+    textView.isContinuousSpellCheckingEnabled = false
+    textView.isGrammarCheckingEnabled = false
+    textView.usesFindPanel = true
+    textView.isVerticallyResizable = true
+    textView.isHorizontallyResizable = false
+    textView.autoresizingMask = [.width]
+    textView.textContainerInset = NSSize(width: 10, height: 10)
+    textView.font = .preferredFont(forTextStyle: .body)
+    textView.backgroundColor = .textBackgroundColor
+    textView.drawsBackground = true
+    textView.string = text
+    textView.allowsUndo = true
+    textView.textContainer?.widthTracksTextView = true
+    textView.textContainer?.containerSize = NSSize(width: 0, height: CGFloat.greatestFiniteMagnitude)
+
+    scrollView.documentView = textView
+    context.coordinator.textView = textView
+
+    return scrollView
+  }
+
+  func updateNSView(_ scrollView: NSScrollView, context: Context) {
+    guard let textView = context.coordinator.textView else { return }
+    guard !context.coordinator.isApplyingLocalChange else { return }
+    guard !textView.hasMarkedText() else { return }
+    guard textView.string != text else { return }
+
+    let selectedRanges = textView.selectedRanges
+    textView.string = text
+    textView.setSelectedRanges(selectedRanges, affinity: .downstream, stillSelecting: false)
+  }
+
+  final class Coordinator: NSObject, NSTextViewDelegate {
+    @Binding var text: String
+    weak var textView: NSTextView?
+    var isApplyingLocalChange = false
+
+    init(text: Binding<String>) {
+      _text = text
+    }
+
+    func textDidChange(_ notification: Notification) {
+      guard let textView else { return }
+      guard !textView.hasMarkedText() else { return }
+      isApplyingLocalChange = true
+      text = textView.string
+      isApplyingLocalChange = false
+    }
+  }
+}
+
+final class UndoFriendlyTextView: NSTextView {
+  override func keyDown(with event: NSEvent) {
+    let isControlOnly = event.modifierFlags.intersection(.deviceIndependentFlagsMask) == .control
+    let isControlShift = event.modifierFlags.intersection(.deviceIndependentFlagsMask) == [.control, .shift]
+
+    if isControlOnly, event.charactersIgnoringModifiers?.lowercased() == "z" {
+      undoManager?.undo()
+      return
+    }
+
+    if isControlShift, event.charactersIgnoringModifiers?.lowercased() == "z" {
+      undoManager?.redo()
+      return
+    }
+
+    super.keyDown(with: event)
   }
 }
 
