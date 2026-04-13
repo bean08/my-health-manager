@@ -1,6 +1,6 @@
 # My Health Manager
 
-License: [Apache-2.0](LICENSE)
+[中文文档](README.zh.md) · License: [Apache-2.0](LICENSE)
 
 `My Health Manager` is a native macOS health assistant for lightweight recurring wellness prompts. It runs from the macOS menu bar, keeps reminder data in a user-editable JSON file, and supports multiple custom reminders with independent schedules and content.
 
@@ -11,9 +11,11 @@ License: [Apache-2.0](LICENSE)
 - Main window with separate modules for reminders and global settings
 - Multiple reminders, each with its own title, interval, snooze time, sound, and content
 - Markdown reminder content with live preview and image insertion
-- Floating alert card shown at the top-right corner
+- Floating alert card shown at the top-right corner with native rendering and auto-sized content
 - Selectable per-reminder sounds with preview
 - Menu bar quick controls bound to a chosen reminder
+- Live countdown updates inside the menu bar menu
+- Optional suppression while presenting or screen sharing based on app keywords
 - External `settings.json` storage with configurable path
 - Universal macOS packaging script for Apple Silicon and Intel
 
@@ -61,14 +63,13 @@ Stored reminder fields:
 
 ## Release
 
-- Current version: `0.0.1`
-- Recommended Git tag: `0.0.1`
-- Latest changes in `0.0.1`:
-  - Added the first open-source release of My Health Manager for macOS
-  - Added multi-reminder management with independent scheduling and content
-  - Added Markdown content, image insertion, and per-reminder sounds
-  - Added external `settings.json` storage with configurable path
-  - Added global settings and menu bar quick actions
+- Current version: `0.0.2`
+- Recommended Git tag: `0.0.2`
+- Latest changes in `0.0.2`:
+  - Added presentation suppression support for meeting and screen-sharing scenarios
+  - Added live countdown updates inside the menu bar menu
+  - Refined the alert popup with transparent styling, native content rendering, and auto-sized content
+  - Improved sidebar selection reliability for module switching
 - Release notes: [CHANGELOG.md](CHANGELOG.md)
 
 ## License

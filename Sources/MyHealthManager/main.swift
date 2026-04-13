@@ -127,30 +127,41 @@ struct ReminderConfig: Identifiable, Codable, Hashable {
   }
 }
 
+struct GlobalSettings: Codable, Hashable {
+  var menuBarReminderID: UUID?
+  var suppressDuringPresenting: Bool
+  var presentationAppKeywords: [String]
+
+  static func `default`() -> GlobalSettings {
+    GlobalSettings(
+      menuBarReminderID: nil,
+      suppressDuringPresenting: true,
+      presentationAppKeywords: ["钉钉"]
+    )
+  }
+}
+
+struct AppDiskStore: Codable {
+  var version: Int
+  var reminders: [ReminderConfig]
+  var settings: GlobalSettings
+}
+
 final class ReminderStore: ObservableObject {
   @Published var reminders: [ReminderConfig] = [] {
     didSet { persist() }
   }
   @Published var selectedReminderID: UUID?
-  @Published var menuBarReminderID: UUID? {
-    didSet {
-      UserDefaults.standard.set(menuBarReminderID?.uuidString, forKey: Self.menuBarReminderDefaultsKey)
-    }
+  @Published var globalSettings: GlobalSettings = .default() {
+    didSet { persist() }
   }
   @Published private(set) var storageFileURL: URL
 
   private static let storagePathDefaultsKey = "storageFilePath"
-  private static let menuBarReminderDefaultsKey = "menuBarReminderID"
 
   init() {
     let path = UserDefaults.standard.string(forKey: Self.storagePathDefaultsKey) ?? Self.defaultStorageFilePath()
     storageFileURL = Self.resolveStorageFileURL(from: path)
-    if
-      let raw = UserDefaults.standard.string(forKey: Self.menuBarReminderDefaultsKey),
-      let uuid = UUID(uuidString: raw)
-    {
-      menuBarReminderID = uuid
-    }
     load()
   }
 
@@ -168,8 +179,12 @@ final class ReminderStore: ObservableObject {
   }
 
   var menuBarReminder: ReminderConfig? {
-    guard let menuBarReminderID else { return reminders.first }
+    guard let menuBarReminderID = globalSettings.menuBarReminderID else { return reminders.first }
     return reminders.first(where: { $0.id == menuBarReminderID }) ?? reminders.first
+  }
+
+  var menuBarReminderID: UUID? {
+    globalSettings.menuBarReminderID
   }
 
   func select(_ id: UUID) {
@@ -180,8 +195,8 @@ final class ReminderStore: ObservableObject {
     let reminder = ReminderConfig.newTemplate(index: reminders.count + 1)
     reminders.append(reminder)
     selectedReminderID = reminder.id
-    if menuBarReminderID == nil {
-      menuBarReminderID = reminder.id
+    if globalSettings.menuBarReminderID == nil {
+      globalSettings.menuBarReminderID = reminder.id
     }
   }
 
@@ -189,8 +204,8 @@ final class ReminderStore: ObservableObject {
     guard let selectedReminderID else { return }
     reminders.removeAll { $0.id == selectedReminderID }
     self.selectedReminderID = reminders.first?.id
-    if menuBarReminderID == selectedReminderID {
-      menuBarReminderID = reminders.first?.id
+    if globalSettings.menuBarReminderID == selectedReminderID {
+      globalSettings.menuBarReminderID = reminders.first?.id
     }
     persist()
   }
@@ -213,32 +228,49 @@ final class ReminderStore: ObservableObject {
   }
 
   func selectMenuBarReminder(_ id: UUID?) {
-    menuBarReminderID = id
+    globalSettings.menuBarReminderID = id
   }
 
   private func load() {
-    guard
+    if
       let data = try? Data(contentsOf: storageFileURL),
-      let decoded = try? JSONDecoder().decode([ReminderConfig].self, from: data),
-      !decoded.isEmpty
-    else {
-      reminders = [ReminderConfig.neckRotationExample()]
-      selectedReminderID = reminders.first?.id
+      let decoded = try? JSONDecoder().decode(AppDiskStore.self, from: data),
+      !decoded.reminders.isEmpty
+    {
+      reminders = decoded.reminders
+      globalSettings = decoded.settings
+      selectedReminderID = decoded.reminders.first?.id
+      if menuBarReminder == nil {
+        globalSettings.menuBarReminderID = decoded.reminders.first?.id
+      }
+      return
+    }
+
+    if
+      let data = try? Data(contentsOf: storageFileURL),
+      let legacyReminders = try? JSONDecoder().decode([ReminderConfig].self, from: data),
+      !legacyReminders.isEmpty
+    {
+      reminders = legacyReminders
+      globalSettings = .default()
+      selectedReminderID = legacyReminders.first?.id
+      globalSettings.menuBarReminderID = legacyReminders.first?.id
       persist()
       return
     }
 
-    reminders = decoded
-    selectedReminderID = decoded.first?.id
-    if menuBarReminder == nil {
-      menuBarReminderID = decoded.first?.id
-    }
+    reminders = [ReminderConfig.neckRotationExample()]
+    globalSettings = .default()
+    selectedReminderID = reminders.first?.id
+    globalSettings.menuBarReminderID = reminders.first?.id
+    persist()
   }
 
   private func persist() {
     let directory = storageFileURL.deletingLastPathComponent()
     try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-    guard let data = try? JSONEncoder().encode(reminders) else { return }
+    let disk = AppDiskStore(version: 1, reminders: reminders, settings: globalSettings)
+    guard let data = try? JSONEncoder().encode(disk) else { return }
     try? data.write(to: storageFileURL, options: .atomic)
   }
 
@@ -286,10 +318,12 @@ final class ReminderManager: ObservableObject {
   @Published private(set) var stateByID: [UUID: SessionState] = [:]
   @Published private(set) var remainingByID: [UUID: Int] = [:]
   @Published private(set) var currentAlertReminderID: UUID?
+  @Published private(set) var activeApplicationName: String = ""
 
   private let store: ReminderStore
   private var timer: Timer?
   private var wakeObserver: NSObjectProtocol?
+  private var appObserver: NSObjectProtocol?
   private var storeObserver: AnyCancellable?
   private var dueDateByID: [UUID: Date] = [:]
   private var pausedSecondsByID: [UUID: Int] = [:]
@@ -298,6 +332,7 @@ final class ReminderManager: ObservableObject {
   init(store: ReminderStore) {
     self.store = store
     synchronize(with: store.reminders)
+    activeApplicationName = NSWorkspace.shared.frontmostApplication?.localizedName ?? ""
     storeObserver = store.$reminders
       .receive(on: RunLoop.main)
       .sink { [weak self] reminders in
@@ -305,12 +340,16 @@ final class ReminderManager: ObservableObject {
       }
     startTicker()
     observeWakeEvents()
+    observeActiveApplication()
   }
 
   deinit {
     timer?.invalidate()
     if let wakeObserver {
       NotificationCenter.default.removeObserver(wakeObserver)
+    }
+    if let appObserver {
+      NotificationCenter.default.removeObserver(appObserver)
     }
   }
 
@@ -410,6 +449,17 @@ final class ReminderManager: ObservableObject {
     }
   }
 
+  private func observeActiveApplication() {
+    appObserver = NSWorkspace.shared.notificationCenter.addObserver(
+      forName: NSWorkspace.didActivateApplicationNotification,
+      object: nil,
+      queue: .main
+    ) { [weak self] notification in
+      let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
+      self?.activeApplicationName = app?.localizedName ?? app?.bundleIdentifier ?? ""
+    }
+  }
+
   private func startTicker() {
     timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
       self?.tick(now: Date())
@@ -446,6 +496,15 @@ final class ReminderManager: ObservableObject {
   }
 
   private func triggerAlert(for reminder: ReminderConfig) {
+    if shouldSuppressAlert(for: reminder) {
+      let retryAfter: Int = 60
+      dueDateByID[reminder.id] = Date().addingTimeInterval(TimeInterval(retryAfter))
+      remainingByID[reminder.id] = retryAfter
+      pausedSecondsByID[reminder.id] = 0
+      stateByID[reminder.id] = .running
+      return
+    }
+
     dueDateByID[reminder.id] = nil
     remainingByID[reminder.id] = 0
     pausedSecondsByID[reminder.id] = 0
@@ -460,6 +519,16 @@ final class ReminderManager: ObservableObject {
 
     if reminder.soundEnabled {
       ReminderSound.play(named: reminder.soundName)
+    }
+  }
+
+  private func shouldSuppressAlert(for reminder: ReminderConfig) -> Bool {
+    guard store.globalSettings.suppressDuringPresenting else { return false }
+    let appName = activeApplicationName.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !appName.isEmpty else { return false }
+    let lowercasedAppName = appName.lowercased()
+    return store.globalSettings.presentationAppKeywords.contains { keyword in
+      lowercasedAppName.contains(keyword.lowercased())
     }
   }
 
@@ -490,13 +559,21 @@ final class ReminderManager: ObservableObject {
 
 final class AlertWindowController {
   private var panel: NSPanel?
-  private let panelSize = NSSize(width: 460, height: 360)
+  private let panelWidth: CGFloat = 438
+  private let minimumPanelHeight: CGFloat = 280
 
   func present(manager: ReminderManager, reminder: ReminderConfig, baseDirectoryURL: URL) {
     let panel = panel ?? makePanel()
-    let rootView = AlertCardView(manager: manager, reminder: reminder, baseDirectoryURL: baseDirectoryURL)
+    let rootView = AlertCardView(
+      manager: manager,
+      reminder: reminder,
+      baseDirectoryURL: baseDirectoryURL
+    ) { [weak self, weak panel] preferredHeight in
+      guard let self, let panel else { return }
+      self.position(panel: panel, preferredHeight: preferredHeight)
+    }
     panel.contentView = NSHostingView(rootView: rootView)
-    position(panel: panel)
+    position(panel: panel, preferredHeight: minimumPanelHeight)
     panel.orderFrontRegardless()
     NSApp.activate(ignoringOtherApps: true)
     self.panel = panel
@@ -508,7 +585,7 @@ final class AlertWindowController {
 
   private func makePanel() -> NSPanel {
     let panel = NSPanel(
-      contentRect: NSRect(origin: .zero, size: panelSize),
+      contentRect: NSRect(origin: .zero, size: NSSize(width: panelWidth, height: minimumPanelHeight)),
       styleMask: [.titled, .fullSizeContentView, .nonactivatingPanel],
       backing: .buffered,
       defer: false
@@ -518,26 +595,38 @@ final class AlertWindowController {
     panel.titleVisibility = .hidden
     panel.titlebarAppearsTransparent = true
     panel.isReleasedWhenClosed = false
+    panel.isOpaque = false
+    panel.backgroundColor = .clear
+    panel.hasShadow = false
     panel.standardWindowButton(.closeButton)?.isHidden = true
     panel.standardWindowButton(.miniaturizeButton)?.isHidden = true
     panel.standardWindowButton(.zoomButton)?.isHidden = true
+    panel.contentView?.wantsLayer = true
+    panel.contentView?.layer?.backgroundColor = NSColor.clear.cgColor
     return panel
   }
 
-  private func position(panel: NSPanel) {
+  private func position(panel: NSPanel, preferredHeight: CGFloat) {
     let screen = NSApp.keyWindow?.screen ?? NSScreen.main ?? NSScreen.screens.first
     let visibleFrame = screen?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
     let margin: CGFloat = 20
+    let panelHeight = max(minimumPanelHeight, min(preferredHeight, visibleFrame.height - margin * 2))
     let origin = NSPoint(
-      x: visibleFrame.maxX - panelSize.width - margin,
-      y: visibleFrame.maxY - panelSize.height - margin
+      x: visibleFrame.maxX - panelWidth - margin,
+      y: visibleFrame.maxY - panelHeight - margin
     )
-    panel.setFrame(NSRect(origin: origin, size: panelSize), display: true)
+    panel.setFrame(NSRect(origin: origin, size: NSSize(width: panelWidth, height: panelHeight)), display: true, animate: true)
   }
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
   private var statusItem: NSStatusItem?
+  private var statusMenu: NSMenu?
+  private var summaryTitleItem: NSMenuItem?
+  private var summaryDetailItem: NSMenuItem?
+  private var primaryActionItem: NSMenuItem?
+  private var remindNowItem: NSMenuItem?
+  private var stopItem: NSMenuItem?
   private weak var mainWindow: NSWindow?
   private var cancellables: Set<AnyCancellable> = []
   private let alertWindowController = AlertWindowController()
@@ -643,11 +732,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
       .receive(on: RunLoop.main)
       .sink { [weak self] _ in
         self?.updateStatusItem()
-        self?.rebuildStatusMenu()
+        self?.updateStatusMenuContent()
       }
       .store(in: &cancellables)
 
-    store?.$menuBarReminderID
+    store?.$globalSettings
       .receive(on: RunLoop.main)
       .sink { [weak self] _ in
         self?.rebuildStatusMenu()
@@ -668,28 +757,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     guard let button = statusItem?.button else { return }
     button.title = ""
     button.toolTip = "我的健康助手"
+    updateStatusMenuContent()
   }
 
   private func rebuildStatusMenu() {
     guard let statusItem else { return }
     let menu = NSMenu()
+    menu.delegate = self
     menu.addItem(NSMenuItem(title: "打开主窗口", action: #selector(openMainWindow(_:)), keyEquivalent: ""))
 
-    if let store, let manager {
-      let summary = manager.currentMenuBarSummary(for: store.menuBarReminder)
-      menu.addItem(.separator())
-      menu.addItem(NSMenuItem(title: summary[0], action: nil, keyEquivalent: ""))
-      let detailItem = NSMenuItem(title: summary[1], action: nil, keyEquivalent: "")
-      detailItem.isEnabled = false
-      menu.addItem(detailItem)
-    }
+    menu.addItem(.separator())
+    let summaryTitleItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+    summaryTitleItem.isEnabled = false
+    menu.addItem(summaryTitleItem)
+    self.summaryTitleItem = summaryTitleItem
 
-    if let store, let manager, let reminder = store.menuBarReminder {
-      let state = manager.state(for: reminder.id)
-      menu.addItem(NSMenuItem(title: menuBarPrimaryTitle(for: state), action: #selector(toggleMenuBarReminder(_:)), keyEquivalent: ""))
-      menu.addItem(NSMenuItem(title: "立即提醒", action: #selector(remindMenuBarReminderNow(_:)), keyEquivalent: ""))
-      menu.addItem(NSMenuItem(title: "停止", action: #selector(stopMenuBarReminder(_:)), keyEquivalent: ""))
-    }
+    let summaryDetailItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+    summaryDetailItem.isEnabled = false
+    menu.addItem(summaryDetailItem)
+    self.summaryDetailItem = summaryDetailItem
+
+    let primaryActionItem = NSMenuItem(title: "", action: #selector(toggleMenuBarReminder(_:)), keyEquivalent: "")
+    menu.addItem(primaryActionItem)
+    self.primaryActionItem = primaryActionItem
+
+    let remindNowItem = NSMenuItem(title: "立即提醒", action: #selector(remindMenuBarReminderNow(_:)), keyEquivalent: "")
+    menu.addItem(remindNowItem)
+    self.remindNowItem = remindNowItem
+
+    let stopItem = NSMenuItem(title: "停止", action: #selector(stopMenuBarReminder(_:)), keyEquivalent: "")
+    menu.addItem(stopItem)
+    self.stopItem = stopItem
 
     menu.addItem(.separator())
     menu.addItem(NSMenuItem(title: "退出", action: #selector(quitApp(_:)), keyEquivalent: "q"))
@@ -698,7 +796,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         item.target = self
       }
     }
+    statusMenu = menu
     statusItem.menu = menu
+    updateStatusMenuContent()
+  }
+
+  private func updateStatusMenuContent() {
+    guard let store, let manager else { return }
+
+    let summary = manager.currentMenuBarSummary(for: store.menuBarReminder)
+    summaryTitleItem?.title = summary[0]
+    summaryDetailItem?.title = summary[1]
+
+    if let reminder = store.menuBarReminder {
+      let state = manager.state(for: reminder.id)
+      primaryActionItem?.title = menuBarPrimaryTitle(for: state)
+      primaryActionItem?.isHidden = false
+      primaryActionItem?.isEnabled = true
+      remindNowItem?.isHidden = false
+      remindNowItem?.isEnabled = true
+      stopItem?.isHidden = false
+      stopItem?.isEnabled = true
+    } else {
+      primaryActionItem?.title = "开始"
+      primaryActionItem?.isHidden = true
+      primaryActionItem?.isEnabled = false
+      remindNowItem?.isHidden = true
+      remindNowItem?.isEnabled = false
+      stopItem?.isHidden = true
+      stopItem?.isEnabled = false
+    }
   }
 
   private func menuBarPrimaryTitle(for state: SessionState) -> String {
@@ -712,6 +839,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     case .alerting:
       return "开始下一轮"
     }
+  }
+}
+
+extension AppDelegate: NSMenuDelegate {
+  func menuWillOpen(_ menu: NSMenu) {
+    updateStatusMenuContent()
   }
 }
 
@@ -933,6 +1066,49 @@ struct ContentView: View {
 
           Text("状态栏里的开始、暂停、立即提醒和停止操作会作用在这里选中的那条提醒。")
             .foregroundStyle(.secondary)
+        }
+        .padding(20)
+        .background(cardBackground)
+
+        VStack(alignment: .leading, spacing: 12) {
+          Text("投屏/演示时暂缓提醒")
+            .font(.title3.weight(.semibold))
+
+          Toggle("当前台应用命中投屏或会议软件时，自动延后提醒", isOn: Binding(
+            get: { store.globalSettings.suppressDuringPresenting },
+            set: { newValue in
+              var settings = store.globalSettings
+              settings.suppressDuringPresenting = newValue
+              store.globalSettings = settings
+            }
+          ))
+
+          VStack(alignment: .leading, spacing: 8) {
+            Text("当前前台应用：\(manager.activeApplicationName.isEmpty ? "无" : manager.activeApplicationName)")
+              .foregroundStyle(.secondary)
+
+            Text("匹配关键字")
+              .font(.subheadline.weight(.medium))
+
+            TextEditor(text: Binding(
+              get: { store.globalSettings.presentationAppKeywords.joined(separator: "\n") },
+              set: { newValue in
+                var settings = store.globalSettings
+                settings.presentationAppKeywords = newValue
+                  .components(separatedBy: .newlines)
+                  .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                  .filter { !$0.isEmpty }
+                store.globalSettings = settings
+              }
+            ))
+            .font(.body)
+            .frame(height: 120)
+            .padding(8)
+            .background(
+              RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .stroke(Color.secondary.opacity(0.25), lineWidth: 1)
+            )
+          }
         }
         .padding(20)
         .background(cardBackground)
@@ -1184,36 +1360,38 @@ struct ModuleTabButton: View {
   let action: () -> Void
 
   var body: some View {
-    Button(action: action) {
-      HStack(spacing: 12) {
-        Image(systemName: module.iconName)
-          .font(.system(size: 18, weight: .semibold))
-          .frame(width: 24)
-        VStack(alignment: .leading, spacing: 2) {
-          Text(module.title)
-            .font(.body.weight(.semibold))
-          Text(module.subtitle)
-            .font(.caption)
-            .foregroundStyle(isSelected ? Color.white.opacity(0.85) : .secondary)
-            .lineLimit(2)
-        }
-        Spacer()
+    HStack(spacing: 12) {
+      Image(systemName: module.iconName)
+        .font(.system(size: 18, weight: .semibold))
+        .frame(width: 24)
+      VStack(alignment: .leading, spacing: 2) {
+        Text(module.title)
+          .font(.body.weight(.semibold))
+        Text(module.subtitle)
+          .font(.caption)
+          .foregroundStyle(isSelected ? Color.white.opacity(0.85) : .secondary)
+          .lineLimit(2)
       }
-      .padding(.horizontal, 14)
-      .padding(.vertical, 12)
-      .frame(maxWidth: .infinity, alignment: .leading)
-      .foregroundStyle(isSelected ? Color.white : Color.primary)
-      .background(
-        RoundedRectangle(cornerRadius: 16, style: .continuous)
-          .fill(isSelected ? Color.accentColor : Color.clear)
-      )
-      .overlay(
-        RoundedRectangle(cornerRadius: 16, style: .continuous)
-          .stroke(isSelected ? Color.accentColor : Color.secondary.opacity(0.15), lineWidth: 1)
-      )
+      Spacer()
     }
-    .buttonStyle(.plain)
-    .contentShape(Rectangle())
+    .padding(.horizontal, 14)
+    .padding(.vertical, 12)
+    .frame(maxWidth: .infinity, alignment: .leading)
+    .foregroundStyle(isSelected ? Color.white : Color.primary)
+    .background(
+      RoundedRectangle(cornerRadius: 16, style: .continuous)
+        .fill(isSelected ? Color.accentColor : Color.clear)
+    )
+    .overlay(
+      RoundedRectangle(cornerRadius: 16, style: .continuous)
+        .stroke(isSelected ? Color.accentColor : Color.secondary.opacity(0.15), lineWidth: 1)
+    )
+    .contentShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+    .onTapGesture(perform: action)
+    .accessibilityElement()
+    .accessibilityAddTraits(isSelected ? [.isButton, .isSelected] : .isButton)
+    .accessibilityLabel(module.title)
+    .accessibilityHint("切换到\(module.title)")
   }
 }
 
@@ -1309,25 +1487,338 @@ struct MarkdownPreview: NSViewRepresentable {
   }
 }
 
+struct AutoSizingMarkdownPreview: NSViewRepresentable {
+  let markdown: String
+  let baseDirectoryURL: URL
+  let onHeightChange: (CGFloat) -> Void
+
+  func makeCoordinator() -> Coordinator {
+    Coordinator(onHeightChange: onHeightChange)
+  }
+
+  func makeNSView(context: Context) -> WKWebView {
+    let controller = WKUserContentController()
+    controller.add(context.coordinator, name: "contentHeight")
+
+    let configuration = WKWebViewConfiguration()
+    configuration.userContentController = controller
+
+    let webView = WKWebView(frame: .zero, configuration: configuration)
+    webView.navigationDelegate = context.coordinator
+    webView.setValue(false, forKey: "drawsBackground")
+    if let scrollView = webView.enclosingScrollView {
+      scrollView.drawsBackground = false
+      scrollView.hasVerticalScroller = false
+      scrollView.hasHorizontalScroller = false
+      scrollView.verticalScrollElasticity = NSScrollView.Elasticity.none
+      scrollView.horizontalScrollElasticity = NSScrollView.Elasticity.none
+    }
+    return webView
+  }
+
+  func updateNSView(_ webView: WKWebView, context: Context) {
+    context.coordinator.onHeightChange = onHeightChange
+    webView.loadHTMLString(
+      MarkdownRenderer.autoSizingHTML(from: markdown),
+      baseURL: baseDirectoryURL
+    )
+  }
+
+  static func dismantleNSView(_ webView: WKWebView, coordinator: Coordinator) {
+    webView.configuration.userContentController.removeScriptMessageHandler(forName: "contentHeight")
+  }
+
+  final class Coordinator: NSObject, WKNavigationDelegate, WKScriptMessageHandler {
+    var onHeightChange: (CGFloat) -> Void
+
+    init(onHeightChange: @escaping (CGFloat) -> Void) {
+      self.onHeightChange = onHeightChange
+    }
+
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+      webView.evaluateJavaScript("window.__reportHeight && window.__reportHeight();", completionHandler: nil)
+    }
+
+    func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+      guard message.name == "contentHeight" else { return }
+
+      let rawValue: Double?
+      if let number = message.body as? NSNumber {
+        rawValue = number.doubleValue
+      } else if let value = message.body as? Double {
+        rawValue = value
+      } else {
+        rawValue = nil
+      }
+
+      guard let rawValue else { return }
+      let resolvedHeight = max(80, ceil(rawValue))
+      DispatchQueue.main.async {
+        self.onHeightChange(resolvedHeight)
+      }
+    }
+  }
+}
+
+private struct ViewHeightPreferenceKey: PreferenceKey {
+  static var defaultValue: CGFloat = 0
+
+  static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+    value = max(value, nextValue())
+  }
+}
+
+enum AlertMarkdownBlock: Hashable {
+  case heading(level: Int, text: String)
+  case paragraph(String)
+  case list([String])
+  case image(alt: String, source: String)
+}
+
+enum AlertMarkdownParser {
+  static func parse(_ markdown: String) -> [AlertMarkdownBlock] {
+    let lines = markdown.replacingOccurrences(of: "\r\n", with: "\n").components(separatedBy: "\n")
+    var blocks: [AlertMarkdownBlock] = []
+    var paragraph: [String] = []
+    var listItems: [String] = []
+
+    func flushParagraph() {
+      guard !paragraph.isEmpty else { return }
+      blocks.append(.paragraph(paragraph.joined(separator: "\n")))
+      paragraph.removeAll()
+    }
+
+    func flushList() {
+      guard !listItems.isEmpty else { return }
+      blocks.append(.list(listItems))
+      listItems.removeAll()
+    }
+
+    for rawLine in lines {
+      let line = rawLine.trimmingCharacters(in: .whitespaces)
+      if line.isEmpty {
+        flushParagraph()
+        flushList()
+        continue
+      }
+
+      if let image = parseImage(line) {
+        flushParagraph()
+        flushList()
+        blocks.append(.image(alt: image.alt, source: image.source))
+        continue
+      }
+
+      if line.hasPrefix("# ") {
+        flushParagraph()
+        flushList()
+        blocks.append(.heading(level: 1, text: String(line.dropFirst(2))))
+        continue
+      }
+      if line.hasPrefix("## ") {
+        flushParagraph()
+        flushList()
+        blocks.append(.heading(level: 2, text: String(line.dropFirst(3))))
+        continue
+      }
+      if line.hasPrefix("### ") {
+        flushParagraph()
+        flushList()
+        blocks.append(.heading(level: 3, text: String(line.dropFirst(4))))
+        continue
+      }
+      if line.hasPrefix("- ") {
+        flushParagraph()
+        listItems.append(String(line.dropFirst(2)))
+        continue
+      }
+
+      paragraph.append(line)
+    }
+
+    flushParagraph()
+    flushList()
+    return blocks
+  }
+
+  private static func parseImage(_ line: String) -> (alt: String, source: String)? {
+    guard
+      let regex = try? NSRegularExpression(pattern: #"^\!\[(.*?)\]\((.*?)\)$"#),
+      let match = regex.firstMatch(in: line, range: NSRange(location: 0, length: (line as NSString).length))
+    else {
+      return nil
+    }
+
+    let nsLine = line as NSString
+    let alt = nsLine.substring(with: match.range(at: 1))
+    let source = nsLine.substring(with: match.range(at: 2))
+    return (alt, source)
+  }
+}
+
+struct AlertMarkdownContent: View {
+  let markdown: String
+  let baseDirectoryURL: URL
+
+  private var blocks: [AlertMarkdownBlock] {
+    AlertMarkdownParser.parse(markdown)
+  }
+
+  var body: some View {
+    VStack(alignment: .leading, spacing: 10) {
+      ForEach(Array(blocks.enumerated()), id: \.offset) { _, block in
+        blockView(block)
+      }
+    }
+    .frame(maxWidth: .infinity, alignment: .leading)
+  }
+
+  @ViewBuilder
+  private func blockView(_ block: AlertMarkdownBlock) -> some View {
+    switch block {
+    case let .heading(level, text):
+      Text(markdownText(from: text))
+        .font(headingFont(level: level))
+        .foregroundStyle(Color.primary)
+        .fixedSize(horizontal: false, vertical: true)
+
+    case let .paragraph(text):
+      Text(markdownText(from: text))
+        .font(.system(size: 15))
+        .foregroundStyle(Color.primary)
+        .fixedSize(horizontal: false, vertical: true)
+
+    case let .list(items):
+      VStack(alignment: .leading, spacing: 6) {
+        ForEach(Array(items.enumerated()), id: \.offset) { _, item in
+          HStack(alignment: .top, spacing: 8) {
+            Text("•")
+              .font(.system(size: 15, weight: .bold))
+              .foregroundStyle(Color(red: 0.82, green: 0.34, blue: 0.30))
+            Text(markdownText(from: item))
+              .font(.system(size: 15))
+              .foregroundStyle(Color.primary)
+              .fixedSize(horizontal: false, vertical: true)
+          }
+        }
+      }
+
+    case let .image(alt, source):
+      AlertMarkdownImage(source: source, baseDirectoryURL: baseDirectoryURL, alt: alt)
+    }
+  }
+
+  private func markdownText(from source: String) -> AttributedString {
+    if let attributed = try? AttributedString(markdown: source) {
+      return attributed
+    }
+    return AttributedString(source)
+  }
+
+  private func headingFont(level: Int) -> Font {
+    switch level {
+    case 1:
+      return .system(size: 23, weight: .bold, design: .rounded)
+    case 2:
+      return .system(size: 19, weight: .bold, design: .rounded)
+    default:
+      return .system(size: 17, weight: .semibold, design: .rounded)
+    }
+  }
+}
+
+struct AlertMarkdownImage: View {
+  let source: String
+  let baseDirectoryURL: URL
+  let alt: String
+
+  private var resolvedImage: NSImage? {
+    let trimmed = source.trimmingCharacters(in: .whitespacesAndNewlines)
+    if let absoluteURL = URL(string: trimmed), absoluteURL.scheme != nil {
+      return NSImage(contentsOf: absoluteURL)
+    }
+
+    let normalizedPath = (trimmed as NSString).expandingTildeInPath
+    if normalizedPath.hasPrefix("/") {
+      return NSImage(contentsOfFile: normalizedPath)
+    }
+
+    let fileURL = baseDirectoryURL.appendingPathComponent(trimmed)
+    return NSImage(contentsOf: fileURL)
+  }
+
+  var body: some View {
+    Group {
+      if let resolvedImage {
+        Image(nsImage: resolvedImage)
+          .resizable()
+          .scaledToFit()
+          .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+      } else if !alt.isEmpty {
+        Text(alt)
+          .font(.caption)
+          .foregroundStyle(.secondary)
+      }
+    }
+    .frame(maxWidth: .infinity, alignment: .leading)
+  }
+}
+
 enum MarkdownRenderer {
   static func html(from markdown: String) -> String {
-    let body = renderBlocks(markdown)
+    htmlDocument(body: renderBlocks(markdown), includeAutoSizingScript: false)
+  }
+
+  static func autoSizingHTML(from markdown: String) -> String {
+    htmlDocument(body: renderBlocks(markdown), includeAutoSizingScript: true)
+  }
+
+  private static func htmlDocument(body: String, includeAutoSizingScript: Bool) -> String {
+    let script = includeAutoSizingScript ? """
+      <script>
+        function reportHeight() {
+          const height = Math.max(
+            document.body.scrollHeight,
+            document.documentElement.scrollHeight
+          );
+          window.webkit.messageHandlers.contentHeight.postMessage(height);
+        }
+        window.__reportHeight = reportHeight;
+        window.addEventListener('load', reportHeight);
+        window.addEventListener('resize', reportHeight);
+        if (document.fonts && document.fonts.ready) {
+          document.fonts.ready.then(reportHeight);
+        }
+        const observer = new ResizeObserver(reportHeight);
+        observer.observe(document.body);
+        Array.from(document.images).forEach((image) => {
+          if (!image.complete) {
+            image.addEventListener('load', reportHeight);
+            image.addEventListener('error', reportHeight);
+          }
+        });
+      </script>
+    """ : ""
+
     return """
     <html>
     <head>
       <meta charset="utf-8">
       <style>
+        html, body { margin: 0; padding: 0; background: transparent; overflow: hidden; }
         body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; padding: 14px; color: #1f2937; line-height: 1.55; background: transparent; }
         h1, h2, h3 { margin: 0 0 10px 0; }
         p { margin: 0 0 10px 0; }
+        p:last-child, ul:last-child, h1:last-child, h2:last-child, h3:last-child { margin-bottom: 0; }
         ul { margin: 0 0 10px 20px; padding: 0; }
         code { background: #f3f4f6; padding: 2px 6px; border-radius: 6px; }
-        img { max-width: 100%; border-radius: 12px; margin: 8px 0; }
+        img { display: block; max-width: 100%; height: auto; border-radius: 12px; margin: 8px 0; }
         strong { font-weight: 700; }
         em { font-style: italic; }
       </style>
     </head>
     <body>\(body)</body>
+    \(script)
     </html>
     """
   }
@@ -1446,25 +1937,40 @@ struct AlertCardView: View {
   @ObservedObject var manager: ReminderManager
   let reminder: ReminderConfig
   let baseDirectoryURL: URL
+  let onPreferredHeightChange: (CGFloat) -> Void
 
   var body: some View {
-    VStack(alignment: .leading, spacing: 18) {
-      HStack(spacing: 10) {
-        Image(systemName: "bell.badge.fill")
-          .font(.system(size: 24, weight: .bold))
-          .foregroundStyle(Color(red: 0.82, green: 0.34, blue: 0.30))
-        Text(reminder.title)
-          .font(.system(size: 28, weight: .bold, design: .rounded))
+    VStack(alignment: .leading, spacing: 16) {
+      HStack(alignment: .top, spacing: 12) {
+        ZStack {
+          Circle()
+            .fill(Color.white.opacity(0.58))
+            .frame(width: 40, height: 40)
+          Image(systemName: "bell.badge.fill")
+            .font(.system(size: 18, weight: .bold))
+            .foregroundStyle(Color(red: 0.82, green: 0.34, blue: 0.30))
+        }
+
+        VStack(alignment: .leading, spacing: 4) {
+          Text(reminder.title)
+            .font(.system(size: 25, weight: .bold, design: .rounded))
+          Text("健康提醒")
+            .font(.subheadline.weight(.medium))
+            .foregroundStyle(.secondary)
+        }
       }
 
-      MarkdownPreview(markdown: reminder.message, baseDirectoryURL: baseDirectoryURL)
-        .frame(height: 150)
+      AlertMarkdownContent(markdown: reminder.message, baseDirectoryURL: baseDirectoryURL)
         .background(
           RoundedRectangle(cornerRadius: 14, style: .continuous)
-            .fill(Color.white.opacity(0.55))
+            .fill(Color.white.opacity(0.18))
+        )
+        .overlay(
+          RoundedRectangle(cornerRadius: 14, style: .continuous)
+            .stroke(Color.white.opacity(0.14), lineWidth: 1)
         )
 
-      HStack(spacing: 14) {
+      HStack(spacing: 10) {
         AlertActionButton(
           title: "开始下一轮",
           icon: "play.fill",
@@ -1492,19 +1998,59 @@ struct AlertCardView: View {
           manager.stop(reminder)
         }
       }
+      .padding(.top, 2)
     }
-    .padding(24)
-    .frame(width: 460, height: 360, alignment: .topLeading)
+    .padding(.horizontal, 24)
+    .padding(.top, 24)
+    .padding(.bottom, 28)
+    .frame(width: 438, alignment: .topLeading)
     .background(
-      LinearGradient(
-        colors: [
-          Color(red: 0.98, green: 0.96, blue: 0.90),
-          Color(red: 0.92, green: 0.96, blue: 0.99)
-        ],
-        startPoint: .topLeading,
-        endPoint: .bottomTrailing
-      )
+      ZStack {
+        LinearGradient(
+          colors: [
+            Color(red: 0.93, green: 0.96, blue: 0.93).opacity(0.56),
+            Color(red: 0.86, green: 0.91, blue: 0.89).opacity(0.48)
+          ],
+          startPoint: .topLeading,
+          endPoint: .bottomTrailing
+        )
+
+        Circle()
+          .fill(Color.white.opacity(0.08))
+          .frame(width: 170, height: 170)
+          .offset(x: 136, y: -116)
+
+        Circle()
+          .fill(Color(red: 0.76, green: 0.80, blue: 0.74).opacity(0.10))
+          .frame(width: 150, height: 150)
+          .offset(x: -148, y: 126)
+      }
     )
+    .background(.ultraThinMaterial.opacity(0.68))
+    .overlay(
+      RoundedRectangle(cornerRadius: 22, style: .continuous)
+        .stroke(Color.white.opacity(0.34), lineWidth: 1.1)
+    )
+    .overlay(
+      RoundedRectangle(cornerRadius: 22, style: .continuous)
+        .stroke(Color.black.opacity(0.08), lineWidth: 0.8)
+        .padding(0.5)
+    )
+    .clipShape(
+      RoundedRectangle(cornerRadius: 22, style: .continuous)
+    )
+    .background(
+      GeometryReader { proxy in
+        Color.clear
+          .preference(key: ViewHeightPreferenceKey.self, value: proxy.size.height)
+      }
+    )
+    .compositingGroup()
+    .shadow(color: Color.black.opacity(0.12), radius: 20, y: 12)
+    .onPreferenceChange(ViewHeightPreferenceKey.self) { height in
+      guard height > 0 else { return }
+      onPreferredHeightChange(height)
+    }
   }
 }
 
@@ -1517,25 +2063,25 @@ struct AlertActionButton: View {
 
   var body: some View {
     Button(action: action) {
-      VStack(spacing: 10) {
+      VStack(spacing: 5) {
         Image(systemName: icon)
-          .font(.system(size: 22, weight: .bold))
+          .font(.system(size: 15, weight: .bold))
         Text(title)
-          .font(.system(size: 16, weight: .semibold))
+          .font(.system(size: 12, weight: .semibold))
           .lineLimit(1)
       }
       .frame(maxWidth: .infinity)
-      .frame(height: 88)
+      .frame(height: 54)
       .foregroundStyle(foregroundColor)
       .background(
-        RoundedRectangle(cornerRadius: 18, style: .continuous)
-          .fill(fillColor)
+        RoundedRectangle(cornerRadius: 13, style: .continuous)
+          .fill(fillColor.opacity(0.92))
       )
       .overlay(
-        RoundedRectangle(cornerRadius: 18, style: .continuous)
+        RoundedRectangle(cornerRadius: 13, style: .continuous)
           .stroke(Color.white.opacity(0.18), lineWidth: 1)
       )
-      .shadow(color: fillColor.opacity(0.22), radius: 10, y: 5)
+      .shadow(color: fillColor.opacity(0.12), radius: 6, y: 3)
     }
     .buttonStyle(.plain)
   }
