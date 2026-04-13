@@ -61,13 +61,14 @@ Stored reminder fields:
 
 ## Release
 
-- Current version: `0.2.0`
-- Recommended Git tag: `v0.2.0`
-- Latest changes in `v0.2.0`:
-  - Added multi-reminder management with independent scheduling
-  - Added Markdown content, image insertion, and sound selection
-  - Added global settings with configurable `settings.json` path
-  - Added menu bar quick actions for a selected reminder
+- Current version: `0.0.1`
+- Recommended Git tag: `0.0.1`
+- Latest changes in `0.0.1`:
+  - Added the first open-source release of My Health Manager for macOS
+  - Added multi-reminder management with independent scheduling and content
+  - Added Markdown content, image insertion, and per-reminder sounds
+  - Added external `settings.json` storage with configurable path
+  - Added global settings and menu bar quick actions
 - Release notes: [CHANGELOG.md](CHANGELOG.md)
 
 ## License
